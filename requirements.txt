@@ -1,0 +1,14 @@
+# 바이낸스 API 연결 및 매매 핵심 라이브러리
+ccxt>=4.4.0
+
+# 데이터 분석 및 이동평균선(224일선) 계산용
+pandas>=2.2.0
+
+# n8n 웹훅 전송 및 HTTP 통신용
+requests>=2.32.0
+
+# .env 파일에서 설정값(API Key 등) 로드용
+python-dotenv>=1.0.1
+
+# pip install pandas_ta
+pandas_ta
