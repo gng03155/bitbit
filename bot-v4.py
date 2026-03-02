@@ -1,3 +1,4 @@
+import atexit
 import os
 import time
 import math
@@ -548,10 +549,19 @@ def evaluate_signal_by_regime(
 
     return signal, float(entry), float(tp), float(sl), float(mid)
 
+
+def on_exit():
+    """스크립트 종료 시 실행될 핸들러"""
+    send_n8n("🛑 봇 종료: 트레이딩 엔진이 종료되었습니다.")
+    logging.info("봇 종료 핸들러 실행")
+
 # =========================================================
 # 7) 메인
 # =========================================================
 def main():
+    #종료 핸들러 등록
+    atexit.register(on_exit)
+
     logging.info(f"🚀 다중 심볼 매매 엔진 가동: {', '.join(SYMBOLS)}")
     send_n8n(f"🤖 봇 가동 시작: 감시 종목 {len(SYMBOLS)}개")
 
