@@ -1,4 +1,5 @@
-import atexit
+import sys
+import signal as sig
 import os
 import time
 import math
@@ -549,18 +550,22 @@ def evaluate_signal_by_regime(
 
     return signal, float(entry), float(tp), float(sl), float(mid)
 
-
-def on_exit():
-    """스크립트 종료 시 실행될 핸들러"""
-    send_n8n("🛑 봇 종료: 트레이딩 엔진이 종료되었습니다.")
-    logging.info("봇 종료 핸들러 실행")
+# =========================================================
+# 메인 및 종료 처리
+# =========================================================
+def handle_exit(signum, frame):
+    """Ctrl+C 및 pm2 stop 시그널을 모두 받아 처리하는 단일 핸들러"""
+    logging.info("🛑 종료 시그널 수신. 봇을 안전하게 종료합니다.")
+    send_n8n("🛑 봇 종료: 트레이딩 엔진이 가동을 멈췄습니다.")
+    sys.exit(0)
 
 # =========================================================
 # 7) 메인
 # =========================================================
 def main():
-    #종료 핸들러 등록
-    atexit.register(on_exit)
+    # 윈도우(Ctrl+C)와 리눅스(pm2 stop) 종료 시그널을 하나의 핸들러로 연결
+    sig.signal(sig.SIGINT, handle_exit)
+    sig.signal(sig.SIGTERM, handle_exit)
 
     logging.info(f"🚀 다중 심볼 매매 엔진 가동: {', '.join(SYMBOLS)}")
     send_n8n(f"🤖 봇 가동 시작: 감시 종목 {len(SYMBOLS)}개")
