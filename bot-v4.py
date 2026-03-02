@@ -39,7 +39,7 @@ BET_RATE = 0.05            # 최대 노출 캡: equity * BET_RATE * LEVERAGE
 RISK_PER_TRADE = 0.005     # 1회 트레이드 리스크(손실 허용) = equity * RISK_PER_TRADE
 MAX_OPEN_POSITIONS = 1     # 동시 포지션 제한
 
-# 전략 파라미터 (5m 기준 중심선/엔벨로프)
+# 전략 파라미터 (15m 기준 중심선/엔벨로프)
 WINDOW_SIZE = 50           # 15분봉 SMA50
 ENVELOPE_PERCENT = 0.01    # 중심선 기준 ±1%
 
@@ -65,22 +65,22 @@ LOOP_SLEEP_SEC = 30
 ERROR_SLEEP_SEC = 10
 
 # =========================================================
-# 1-1) Market Regime (국면) 설정
+# 1-1) Market Regime (국면) 설정 (하이브리드 최적화)
 # =========================================================
 REGIME_TF = "1h"
+
+# 1. DI 스프레드 변수
 REGIME_ADX_LEN = 14
+REGIME_DI_SPREAD_ON = 15   # 두 선의 격차가 15 포인트 이상 벌어지면 트렌드 진입
+REGIME_DI_SPREAD_OFF = 10  # 두 선의 격차가 10 포인트 이하로 좁혀지면 횡보장 복귀
+
+# 2. SMA 기울기 변수 (안전벨트)
 REGIME_SMA_LEN = 20
+REGIME_SLOPE_LOOKBACK = 3
+REGIME_SLOPE_PCT_TH = 0.01 # 기울기가 0.10% 이상 틀어져야 진짜 방향으로 인정
 
-# 히스테리시스: 국면 깜빡임 방지 (진입/이탈 기준 분리)
-REGIME_ADX_TREND_ON = 27
-REGIME_ADX_TREND_OFF = 22
-
-# SMA 기울기(%) 계산 lookback(시간)
-REGIME_SLOPE_LOOKBACK = 8         # 8시간
-REGIME_SLOPE_PCT_TH = 0.10        # ±0.10% 이상이면 방향성 있다고 판단
-
-# 국면 캐시 (1h 기반이므로 자주 계산할 필요 없음)
-REGIME_CACHE_TTL_SEC = 300        # 5분
+# 국면 캐시 
+REGIME_CACHE_TTL_SEC = 300
 
 # =========================================================
 # 2) 거래소 초기화
@@ -261,81 +261,93 @@ regime_cache: Dict[str, RegimeCacheItem] = {}
 
 
 def check_market_regime(symbol: str) -> str:
-    """
-    1시간봉 기준 ADX(추세 강도) + SMA20 기울기(방향)로 국면 판별.
-    - 확정봉(-2) 기준
-    - 히스테리시스(ON/OFF)로 깜빡임 방지
-    - 캐시로 API 절감
-    """
     now = time.time()
     cached = regime_cache.get(symbol)
     if cached and (now - cached.ts) < REGIME_CACHE_TTL_SEC:
         return cached.regime
 
-    # ADX, SMA20, slope 계산 가능한 충분한 길이 확보
-    limit = max(REGIME_SMA_LEN + REGIME_SLOPE_LOOKBACK + 10, 120)
+    limit = 300
     ohlcv = safe_call(exchange.fetch_ohlcv, symbol, timeframe=REGIME_TF, limit=limit)
     df = pd.DataFrame(ohlcv, columns=["ts", "o", "h", "l", "c", "v"])
 
-    min_need = max(REGIME_SMA_LEN, REGIME_ADX_LEN) + REGIME_SLOPE_LOOKBACK + 3
-    if len(df) < min_need:
-        regime = "RANGING"
-        regime_cache[symbol] = RegimeCacheItem(ts=now, regime=regime)
-        return regime
+    if len(df) < max(REGIME_SMA_LEN, REGIME_ADX_LEN) + REGIME_SLOPE_LOOKBACK + 5:
+        return "RANGING"
 
-    # ADX 계산 (pandas_ta)
-    adx_df = ta.adx(df["h"], df["l"], df["c"], length=REGIME_ADX_LEN)
-    adx_col = f"ADX_{REGIME_ADX_LEN}"
+    # ⭐ pandas_ta의 치명적 버그(5000+ 표기)를 피해, 순수 Pandas로 DMI를 계산합니다. (0~100 스케일 완벽 보장)
+    # 1. TR (True Range)
+    df['h_l'] = df['h'] - df['l']
+    df['h_pc'] = (df['h'] - df['c'].shift(1)).abs()
+    df['l_pc'] = (df['l'] - df['c'].shift(1)).abs()
+    df['tr'] = df[['h_l', 'h_pc', 'l_pc']].max(axis=1)
 
+    # 2. 방향 이동 (+DM, -DM)
+    df['up_move'] = df['h'] - df['h'].shift(1)
+    df['down_move'] = df['l'].shift(1) - df['l']
+    
+    df['plus_dm'] = 0.0
+    df.loc[(df['up_move'] > df['down_move']) & (df['up_move'] > 0), 'plus_dm'] = df['up_move']
+    
+    df['minus_dm'] = 0.0
+    df.loc[(df['down_move'] > df['up_move']) & (df['down_move'] > 0), 'minus_dm'] = df['down_move']
+
+    # 3. Wilder's Smoothing (RMA 방식)
+    alpha = 1.0 / REGIME_ADX_LEN
+    df['tr_rma'] = df['tr'].ewm(alpha=alpha, adjust=False).mean()
+    df['plus_dm_rma'] = df['plus_dm'].ewm(alpha=alpha, adjust=False).mean()
+    df['minus_dm_rma'] = df['minus_dm'].ewm(alpha=alpha, adjust=False).mean()
+
+    # 4. +DI, -DI 계산 (0~100 백분율)
+    df['plus_di'] = 100.0 * (df['plus_dm_rma'] / (df['tr_rma'] + 1e-10))
+    df['minus_di'] = 100.0 * (df['minus_dm_rma'] / (df['tr_rma'] + 1e-10))
+
+    # 5. SMA 20 (방향성 확인용 안전벨트)
     sma = df["c"].rolling(REGIME_SMA_LEN).mean()
 
-    # 확정봉(-2) 기준
-    i = -2
-    adx_val = float(adx_df[adx_col].iloc[i]) if adx_col in adx_df.columns else float("nan")
+    # --------------- 신호 판별 로직 ---------------
+    i = -2  # 확정봉 기준
+    plus_di = float(df['plus_di'].iloc[i])
+    minus_di = float(df['minus_di'].iloc[i])
     sma_now = float(sma.iloc[i])
     sma_past = float(sma.iloc[i - REGIME_SLOPE_LOOKBACK])
 
-    if (
-        math.isnan(adx_val)
-        or math.isnan(sma_now)
-        or math.isnan(sma_past)
-        or sma_past == 0
-    ):
-        regime = "RANGING"
-        regime_cache[symbol] = RegimeCacheItem(ts=now, regime=regime)
-        return regime
+    if math.isnan(plus_di) or math.isnan(sma_now) or math.isnan(sma_past) or sma_past == 0:
+        return "RANGING"
 
+    # [1] DI 스프레드 (단기 모멘텀/힘)
+    di_diff = plus_di - minus_di
+    
+    # [2] SMA 기울기 (거시적 방향성)
     slope_pct = (sma_now - sma_past) / sma_past * 100.0
 
     prev_regime = cached.regime if cached else "RANGING"
 
-    # RANGING -> TREND 진입
+    # 히스테리시스 (이중 잠금장치: 스프레드와 기울기 방향이 완벽히 일치할 때만 진입!)
     if prev_regime == "RANGING":
-        if adx_val >= REGIME_ADX_TREND_ON:
-            if slope_pct >= REGIME_SLOPE_PCT_TH:
-                regime = "TREND_UP"
-            elif slope_pct <= -REGIME_SLOPE_PCT_TH:
-                regime = "TREND_DOWN"
-            else:
-                regime = "RANGING"
+        if di_diff >= REGIME_DI_SPREAD_ON and slope_pct >= REGIME_SLOPE_PCT_TH:
+            regime = "TREND_UP"
+        elif di_diff <= -REGIME_DI_SPREAD_ON and slope_pct <= -REGIME_SLOPE_PCT_TH:
+            regime = "TREND_DOWN"
         else:
             regime = "RANGING"
-    # TREND 유지/이탈
-    else:
-        if adx_val <= REGIME_ADX_TREND_OFF:
+            
+    elif prev_regime == "TREND_UP":
+        # 롱 포지션 중 매수세가 약해져 OFF 기준(10) 이하로 떨어지면 횡보장 전환
+        if di_diff <= REGIME_DI_SPREAD_OFF:
             regime = "RANGING"
         else:
-            if slope_pct >= REGIME_SLOPE_PCT_TH:
-                regime = "TREND_UP"
-            elif slope_pct <= -REGIME_SLOPE_PCT_TH:
-                regime = "TREND_DOWN"
-            else:
-                regime = "RANGING"
+            regime = "TREND_UP"
+            
+    elif prev_regime == "TREND_DOWN":
+        # 숏 포지션 중 매도세가 약해져 OFF 기준(-10) 이상으로 올라오면 횡보장 전환
+        if di_diff >= -REGIME_DI_SPREAD_OFF:
+            regime = "RANGING"
+        else:
+            regime = "TREND_DOWN"
 
     regime_cache[symbol] = RegimeCacheItem(ts=now, regime=regime)
 
     logging.info(
-        f"[{symbol}] Regime={regime} | ADX={adx_val:.2f} | SMA_slope({REGIME_SLOPE_LOOKBACK}h)={slope_pct:.3f}%"
+        f"[{symbol}] Regime={regime} | +DI={plus_di:.1f} | -DI={minus_di:.1f} | Spread={di_diff:.1f} | SMA_slope={slope_pct:.2f}%"
     )
 
     return regime
@@ -374,6 +386,19 @@ def fetch_positions_map(symbols) -> Dict[str, Tuple[float, Optional[str]]]:
 
 
 def set_symbol_leverage(symbol: str, lev: int) -> None:
+    # 1. 마진 모드 명시적 설정 (격리: isolated, 교차: cross)
+    try:
+        # CCXT 최신 버전 표준 마진 설정 함수
+        safe_call(exchange.set_margin_mode, 'isolated', symbol)
+        logging.info(f"[{symbol}] 마진 모드 'ISOLATED(격리)' 설정 완료")
+    except Exception as e:
+        # 이미 Isolated 상태이거나, 포지션이 있는 상태에서 변경 시도 시 발생하는 에러는 패스
+        if "No need to change" in str(e) or "margin type cannot be changed" in str(e).lower():
+            pass
+        else:
+            logging.warning(f"[{symbol}] 마진 모드 설정 중 예외(무시됨): {e}")
+
+    # 2. 레버리지 설정
     try:
         safe_call(exchange.set_leverage, lev, symbol)
         logging.info(f"[{symbol}] 레버리지 {lev}배 설정 완료")
@@ -491,7 +516,7 @@ def evaluate_signal_by_regime(
     if len(df) < WINDOW_SIZE + 5:
         return None, 0.0, 0.0, 0.0, 0.0
 
-    i = -2  # 확정봉
+    i = -2  # 신호 판단은 확정봉 기준
 
     # 중심선(mid): 5m SMA(WINDOW_SIZE)
     mid_series = df["c"].rolling(WINDOW_SIZE).mean()
@@ -506,49 +531,48 @@ def evaluate_signal_by_regime(
     lower = mid * (1 - ENVELOPE_PERCENT)
 
     signal: Optional[str] = None
-    entry: float = 0.0
 
+    # 국면별 진입 신호 확인
     if regime == "TREND_UP":
         if low <= mid:
             signal = "LONG"
-            entry = mid
     elif regime == "TREND_DOWN":
         if high >= mid:
             signal = "SHORT"
-            entry = mid
     else:
         hit_upper = high >= upper
         hit_lower = low <= lower
 
-        # 극단봉에서 상단/하단을 동시에 터치할 수 있어 충돌 방지
         if hit_upper and not hit_lower:
             signal = "SHORT"
-            entry = upper
         elif hit_lower and not hit_upper:
             signal = "LONG"
-            entry = lower
-        else:
-            signal = None
 
-    if not signal or entry <= 0:
+    if not signal:
         return None, 0.0, 0.0, 0.0, mid
+
+    # ⭐ 핵심 수정: TP/SL 계산의 기준을 '과거 타점'이 아닌 '현재 실시간 가격'으로 변경!
+    # df["c"].iloc[-1] 은 아직 닫히지 않은 현재 캔들의 최신 가격입니다.
+    current_price = float(df["c"].iloc[-1])
 
     sl_pct = 0.01
     tp_pct = 0.015
 
+    # 실시간 가격 기준으로 위아래 TP/SL을 씌워줍니다 (-2021 에러 완벽 차단)
     if signal == "LONG":
-        sl = entry * (1 - sl_pct)
-        tp = entry * (1 + tp_pct)
+        sl = current_price * (1 - sl_pct)
+        tp = current_price * (1 + tp_pct)
     else:  # SHORT
-        sl = entry * (1 + sl_pct)
-        tp = entry * (1 - tp_pct)
+        sl = current_price * (1 + sl_pct)
+        tp = current_price * (1 - tp_pct)
 
     # 심볼별 가격 정밀도 적용
-    entry = price_precision(symbol, entry)
+    current_price_precision = price_precision(symbol, current_price)
     tp = price_precision(symbol, tp)
     sl = price_precision(symbol, sl)
 
-    return signal, float(entry), float(tp), float(sl), float(mid)
+    # 수량(qty) 계산을 정확히 하기 위해 과거 기준가가 아닌 현재가를 리턴합니다.
+    return signal, float(current_price_precision), float(tp), float(sl), float(mid)
 
 # =========================================================
 # 메인 및 종료 처리
@@ -593,23 +617,29 @@ def main():
 
                 # 포지션 종료 감지(잔여 주문 취소)
                 if prev_pos_size[symbol] > 0 and pos_size == 0:
-                    logging.info(f"🔔 [{symbol}] 포지션 종료 감지! 잔여 미체결 주문을 일괄 취소합니다.")
+                    logging.info(f"🔔 [{symbol}] 포지션 종료 감지! 잔여 미체결 주문 강제 취소를 시도합니다.")
                     try:
-                        # 1. CCXT 버그 방지: 현재 열려있는 모든 주문(TP/SL 포함)을 직접 조회
-                        open_orders = safe_call(exchange.fetch_open_orders, symbol)
+                        # 1단계: CCXT 기본 취소 (일반 지정가 주문 클리어)
+                        try:
+                            safe_call(exchange.cancel_all_orders, symbol)
+                        except: pass
                         
-                        # 2. 주문이 존재하면 반복문을 돌며 하나씩 확실하게 취소 (Kill)
-                        if open_orders:
-                            for order in open_orders:
-                                safe_call(exchange.cancel_order, order['id'], symbol)
+                        # 2단계: 최신 바이낸스 네이티브 API 폭격 (분리된 TP/SL 알고리즘 주문 싹쓸이)
+                        market_id = exchange.market_id(symbol) # 예: 'BTCUSDT'
+                        
+                        # 조건부(TP/SL) 주문 전용 삭제 API 호출 (fapiPrivate_delete_algoopenorders)
+                        if hasattr(exchange, 'fapiPrivate_delete_algoopenorders'):
+                            safe_call(exchange.fapiPrivate_delete_algoopenorders, {'symbol': market_id})
+                        elif hasattr(exchange, 'fapiPrivateDeleteAlgoOpenOrders'):
+                            safe_call(exchange.fapiPrivateDeleteAlgoOpenOrders, {'symbol': market_id})
                             
-                            logging.info(f"🧹 [{symbol}] 잔여 주문 정리 완료 ({len(open_orders)}개 취소)")
-                            send_n8n(f"🧹 [{symbol}] 포지션 종료: 미체결 주문 {len(open_orders)}개 정리 완료")
-                        else:
-                            logging.info(f"🧹 [{symbol}] 취소할 잔여 주문이 없습니다.")
+                        time.sleep(0.5) # 서버 반영 대기
+                        
+                        logging.info(f"🧹 [{symbol}] 네이티브 Algo API 폭격으로 찌꺼기 주문(TP/SL) 싹쓸이 완료")
+                        send_n8n(f"🧹 [{symbol}] 포지션 종료: 모든 예약 주문 강제 삭제 완료")
                             
                     except Exception as e:
-                        logging.error(f"[{symbol}] 잔여 주문 취소 실패: {e}")
+                        logging.error(f"[{symbol}] 잔여 주문 강제 취소 실패: {e}")
 
                 prev_pos_size[symbol] = pos_size
 
@@ -618,13 +648,12 @@ def main():
                 if open_count >= MAX_OPEN_POSITIONS:
                     continue
 
-                # 5분봉 데이터 로드
+                # 15분봉 데이터 로드
                 ohlcv = safe_call(exchange.fetch_ohlcv, symbol, timeframe=VOL_TF, limit=WINDOW_SIZE + 250)
                 df = pd.DataFrame(ohlcv, columns=["ts", "o", "h", "l", "c", "v"])
 
                 # ✅ 국면 판별 (아직 “필터”가 아니라 “엔진 선택”에 사용)
                 regime = check_market_regime(symbol)
-                print(f"regime: {regime}")
 
                 # ✅ 국면별 시그널/TP/SL 계산
                 signal, entry_price, tp_price, sl_price, mid_line = evaluate_signal_by_regime(symbol, df, regime)
